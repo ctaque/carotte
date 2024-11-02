@@ -135,7 +135,7 @@ pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
                         }
                     }
                 }
-
+                // TODO: send message to dead letter queue when these fields can't be parsed or when the multipart can't be set
                 let email = Message::builder()
                     .from(d.from.parse().unwrap())
                     .reply_to(d.reply_to.parse().unwrap())
