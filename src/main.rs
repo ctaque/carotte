@@ -32,12 +32,11 @@ async fn handle_messages(channel: &lapin::Channel, core: usize) {
     let mut queue_name = "queue-mailing-".to_string();
     consumer_tag.push_str(core.to_string().as_str());
     queue_name.push_str(hostname::get().unwrap().to_str().unwrap());
+
+    let mut queue_opts = QueueDeclareOptions::default();
+    queue_opts.durable = true;
     channel
-        .queue_declare(
-            &queue_name,
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        )
+        .queue_declare(&queue_name, queue_opts, FieldTable::default())
         .await
         .expect("Queue declaration failed");
 
