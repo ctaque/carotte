@@ -1,10 +1,17 @@
+use bson::{self, Bson, Document};
 use futures_lite::stream::StreamExt;
 use hostname;
 use lapin::{
     message::Delivery, options::*, types::FieldTable, Channel, Connection, ConnectionProperties,
     Error as LapinError,
 };
+use lettre::{
+    message::{header::ContentType, Attachment, MultiPart, SinglePart},
+    transport::smtp::client::Tls,
+    Message, SmtpTransport, Transport,
+};
 use num_cpus;
+use serde::Deserialize;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
 
 const RMQ_URL: &str = "amqp://localhost:5672/%2f";
@@ -51,19 +58,117 @@ async fn handle_messages(channel: &lapin::Channel, core: usize) {
     }
 }
 
+#[derive(Deserialize)]
+struct CustomAttachment {
+    cid: String,
+    inline: bool,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct EmailData {
+    from: String,
+    to: Vec<String>,
+    bcc: Vec<String>,
+    html: String,
+    text: String,
+    subject: String,
+    reply_to: String,
+    attachments: Vec<CustomAttachment>,
+}
+
+impl EmailData {
+    fn from_delivery(delivery: &Delivery) -> Result<EmailData, bson::de::Error> {
+        let document: Document = bson::from_slice(&delivery.data)?;
+        let bson = Bson::Document(document);
+
+        // Deserialize Bson into EmailData
+        let email: EmailData = bson::from_bson(bson)?;
+
+        Ok(email)
+    }
+}
+
 pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
     match delivery {
         Ok(delivery) => {
-            let data = std::str::from_utf8(&delivery.data);
-            println!("Received message: {:?}", data);
+            println!("Received message: {:?}", delivery);
             // send mail
             // Acknowledge the message
-            if true {
-                channel
-                    .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                    .await
-                    .expect("Failed to ack message");
+
+            let mailer = SmtpTransport::relay("host") // TODO
+                // change
+                // host
+                .unwrap()
+                .port(26)
+                .tls(Tls::None)
+                .build();
+
+            let data = EmailData::from_delivery(&delivery);
+
+            if let Ok(d) = data {
+                let parts = MultiPart::mixed().singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(d.html),
+                );
+
+                for attachment in d.attachments {
+                    match attachment.inline {
+                        true => {
+                            // attach inline
+                            let part = Attachment::new_inline(attachment.cid).body(
+                                attachment.data,
+                                ContentType::parse(attachment.content_type.as_str()).unwrap(),
+                            );
+
+                            parts.clone().singlepart(part);
+                        }
+                        false => {
+                            // dont attach inline
+                            let part = Attachment::new(attachment.cid).body(
+                                attachment.data,
+                                ContentType::parse(attachment.content_type.as_str()).unwrap(),
+                            );
+
+                            parts.clone().singlepart(part);
+                        }
+                    }
+                }
+
+                let email = Message::builder()
+                    .from(d.from.parse().unwrap())
+                    .reply_to(d.reply_to.parse().unwrap())
+                    .to(d.to.join(", ").parse().unwrap())
+                    .bcc(d.bcc.join(", ").parse().unwrap())
+                    .subject(d.subject);
+
+                email.clone().multipart(parts).unwrap();
+                let email = email.body(d.text).unwrap();
+
+                let sent = mailer.send(&email);
+
+                match sent {
+                    Ok(_) => {
+                        //ack
+                        channel
+                            .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                            .await
+                            .expect("Failed to ack message");
+                    }
+                    Err(_e) => {
+                        // requeue
+                        let mut nack_opts = BasicNackOptions::default();
+                        nack_opts.requeue = true;
+                        channel
+                            .basic_nack(delivery.delivery_tag, nack_opts)
+                            .await
+                            .expect("Failed to nack message");
+                    }
+                }
             } else {
+                // dead letter
                 let mut nack_opts = BasicNackOptions::default();
                 nack_opts.requeue = false;
                 channel
