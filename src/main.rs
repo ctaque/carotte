@@ -6,13 +6,22 @@ use lapin::{
     Error as LapinError,
 };
 use lettre::{
-    message::{header::ContentType, Attachment, MultiPart, SinglePart},
+    address::AddressError,
+    message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart},
     transport::smtp::client::Tls,
-    Message, SmtpTransport, Transport,
+    Address, Message, SmtpTransport, Transport,
 };
 use num_cpus;
 use serde::Deserialize;
 use tokio_retry::{strategy::ExponentialBackoff, Retry};
+
+/*
+ * TODO
+ * - logging
+ * - smtp conf (host)
+ * - consume DLQ
+ *
+ */
 
 const RMQ_URL: &str = "amqp://localhost:5672/%2f";
 
@@ -96,9 +105,7 @@ pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
             // send mail
             // Acknowledge the message
 
-            let mailer = SmtpTransport::relay("host") // TODO
-                // change
-                // host
+            let mailer = SmtpTransport::relay("host")
                 .unwrap()
                 .port(26)
                 .tls(Tls::None)
@@ -106,78 +113,119 @@ pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
 
             let data = EmailData::from_delivery(&delivery);
 
-            if let Ok(d) = data {
-                let parts = MultiPart::mixed().singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_HTML)
-                        .body(d.html),
-                );
+            match data {
+                Ok(d) => {
+                    let parts = MultiPart::mixed().singlepart(
+                        SinglePart::builder()
+                            .header(ContentType::TEXT_HTML)
+                            .body(d.html),
+                    );
 
-                for attachment in d.attachments {
-                    match attachment.inline {
-                        true => {
-                            // attach inline
-                            let part = Attachment::new_inline(attachment.cid).body(
-                                attachment.data,
-                                ContentType::parse(attachment.content_type.as_str()).unwrap(),
-                            );
+                    for attachment in d.attachments {
+                        let content_type_res = ContentType::parse(attachment.content_type.as_str());
+                        if let Ok(content_type) = content_type_res {
+                            match attachment.inline {
+                                true => {
+                                    // attach inline
+                                    let part = Attachment::new_inline(attachment.cid)
+                                        .body(attachment.data, content_type);
 
-                            parts.clone().singlepart(part);
+                                    parts.clone().singlepart(part);
+                                }
+                                false => {
+                                    // dont attach inline
+                                    let part = Attachment::new(attachment.cid)
+                                        .body(attachment.data, content_type);
+
+                                    parts.clone().singlepart(part);
+                                }
+                            }
+                        } else {
+                            dead_letter(&delivery, &channel).await;
+                            return;
                         }
-                        false => {
-                            // dont attach inline
-                            let part = Attachment::new(attachment.cid).body(
-                                attachment.data,
-                                ContentType::parse(attachment.content_type.as_str()).unwrap(),
-                            );
+                    }
 
-                            parts.clone().singlepart(part);
+                    let from: Result<Address, AddressError> = d.from.parse();
+                    let reply_to: Result<Address, AddressError> = d.reply_to.parse();
+                    let to: Result<Address, AddressError> = d.to.join(", ").parse();
+                    let bcc: Result<Address, AddressError> = d.bcc.join(", ").parse();
+
+                    if from.is_err() {
+                        dead_letter(&delivery, &channel).await;
+                        return;
+                    }
+
+                    if reply_to.is_err() {
+                        dead_letter(&delivery, &channel).await;
+                        return;
+                    }
+
+                    if to.is_err() {
+                        dead_letter(&delivery, &channel).await;
+                        return;
+                    }
+
+                    if bcc.is_err() {
+                        dead_letter(&delivery, &channel).await;
+                        return;
+                    }
+
+                    let email = Message::builder()
+                        .from(from.unwrap().into())
+                        .reply_to(reply_to.unwrap().into())
+                        .to(to.unwrap().into())
+                        .bcc(bcc.unwrap().into())
+                        .subject(d.subject);
+
+                    let _ = email.clone().multipart(parts);
+
+                    let email_body_res = email.body(d.text);
+
+                    let sent_res = match email_body_res {
+                        Ok(email) => mailer.send(&email),
+                        Err(e) => {
+                            dead_letter(&delivery, &channel).await;
+                            return;
+                        }
+                    };
+
+                    match sent_res {
+                        Ok(_) => {
+                            //ack
+                            channel
+                                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
+                                .await
+                                .expect("Failed to ack message");
+                        }
+                        Err(_e) => {
+                            // requeue
+                            let mut nack_opts = BasicNackOptions::default();
+                            nack_opts.requeue = true;
+                            channel
+                                .basic_nack(delivery.delivery_tag, nack_opts)
+                                .await
+                                .expect("Failed to nack message");
                         }
                     }
                 }
-                // TODO: send message to dead letter queue when these fields can't be parsed or when the multipart can't be set
-                let email = Message::builder()
-                    .from(d.from.parse().unwrap())
-                    .reply_to(d.reply_to.parse().unwrap())
-                    .to(d.to.join(", ").parse().unwrap())
-                    .bcc(d.bcc.join(", ").parse().unwrap())
-                    .subject(d.subject);
-
-                email.clone().multipart(parts).unwrap();
-                let email = email.body(d.text).unwrap();
-
-                let sent = mailer.send(&email);
-
-                match sent {
-                    Ok(_) => {
-                        //ack
-                        channel
-                            .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                            .await
-                            .expect("Failed to ack message");
-                    }
-                    Err(_e) => {
-                        // requeue
-                        let mut nack_opts = BasicNackOptions::default();
-                        nack_opts.requeue = true;
-                        channel
-                            .basic_nack(delivery.delivery_tag, nack_opts)
-                            .await
-                            .expect("Failed to nack message");
-                    }
+                Err(e) => {
+                    println!("could not parse message data: {:#?}", e);
+                    dead_letter(&delivery, &channel).await;
                 }
-            } else {
-                // dead letter
-                let mut nack_opts = BasicNackOptions::default();
-                nack_opts.requeue = false;
-                channel
-                    .basic_nack(delivery.delivery_tag, nack_opts)
-                    .await
-                    .expect("Failed to nack message");
             }
         }
         Err(error) => eprintln!("Error receiving message: {:?}", error),
     }
+}
+
+async fn dead_letter(delivery: &Delivery, channel: &Channel) {
+    let mut nack_opts = BasicNackOptions::default();
+    nack_opts.requeue = false;
+    channel
+        .basic_nack(delivery.delivery_tag, nack_opts)
+        .await
+        .expect("Failed to nack message");
 }
 
 #[tokio::main]
