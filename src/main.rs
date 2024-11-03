@@ -62,7 +62,40 @@ async fn handle_messages(channel: &lapin::Channel, core: usize) {
     println!("receiving messages from queue {}", &queue_name);
 
     while let Some(delivery) = consumer.next().await {
-        consume(delivery, channel.clone()).await;
+        let consume_output = consume(delivery, channel.clone()).await;
+
+        match consume_output {
+            Ok(del) => {
+                let _ = channel
+                    .basic_ack(del.delivery_tag, BasicAckOptions::default())
+                    .await;
+            }
+            Err(e) => {
+                match e.delivery {
+                    Some(del) => {
+                        match e.action {
+                            MsgAction::NackRequeue => {
+                                // requeue
+                                let mut nack_opts = BasicNackOptions::default();
+                                nack_opts.requeue = true;
+                                let _ = channel.basic_nack(del.delivery_tag, nack_opts).await;
+                            }
+                            MsgAction::DeadLetter => {
+                                let mut nack_opts = BasicNackOptions::default();
+                                nack_opts.requeue = false;
+                                let _ = channel.basic_nack(del.delivery_tag, nack_opts).await;
+                            }
+                            MsgAction::NoOp => {
+                                //
+                            }
+                        }
+                    }
+                    None => {
+                        println!("Error message: {:#?}", e.message);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -98,7 +131,22 @@ impl EmailData {
     }
 }
 
-pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
+enum MsgAction {
+    NackRequeue,
+    DeadLetter,
+    NoOp,
+}
+
+pub struct CustomError {
+    message: String,
+    delivery: Option<Delivery>,
+    action: MsgAction,
+}
+
+pub async fn consume(
+    delivery: Result<Delivery, LapinError>,
+    _channel: Channel,
+) -> Result<Delivery, CustomError> {
     match delivery {
         Ok(delivery) => {
             println!("Received message: {:?}", delivery);
@@ -141,8 +189,11 @@ pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
                                 }
                             }
                         } else {
-                            dead_letter(&delivery, &channel).await;
-                            return;
+                            return Err(CustomError {
+                                message: format!("Could not parse attachment Content Type"),
+                                delivery: Some(delivery),
+                                action: MsgAction::DeadLetter,
+                            });
                         }
                     }
 
@@ -152,23 +203,35 @@ pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
                     let bcc: Result<Address, AddressError> = d.bcc.join(", ").parse();
 
                     if from.is_err() {
-                        dead_letter(&delivery, &channel).await;
-                        return;
+                        return Err(CustomError {
+                            message: format!("Could not parse Mail From address"),
+                            delivery: Some(delivery),
+                            action: MsgAction::DeadLetter,
+                        });
                     }
 
                     if reply_to.is_err() {
-                        dead_letter(&delivery, &channel).await;
-                        return;
+                        return Err(CustomError {
+                            message: format!("Could not parse Reply To address"),
+                            delivery: Some(delivery),
+                            action: MsgAction::DeadLetter,
+                        });
                     }
 
                     if to.is_err() {
-                        dead_letter(&delivery, &channel).await;
-                        return;
+                        return Err(CustomError {
+                            message: format!("Could not parse Mail To address"),
+                            delivery: Some(delivery),
+                            action: MsgAction::DeadLetter,
+                        });
                     }
 
                     if bcc.is_err() {
-                        dead_letter(&delivery, &channel).await;
-                        return;
+                        return Err(CustomError {
+                            message: format!("Could not parse Bcc address"),
+                            delivery: Some(delivery),
+                            action: MsgAction::DeadLetter,
+                        });
                     }
 
                     let email = Message::builder()
@@ -185,37 +248,38 @@ pub async fn consume(delivery: Result<Delivery, LapinError>, channel: Channel) {
                     let sent_res = match email_body_res {
                         Ok(email) => mailer.send(&email),
                         Err(e) => {
-                            dead_letter(&delivery, &channel).await;
-                            return;
+                            return Err(CustomError {
+                                message: format!("Could not set email body: {}", e.to_string()),
+                                delivery: Some(delivery),
+                                action: MsgAction::NackRequeue,
+                            });
                         }
                     };
 
                     match sent_res {
                         Ok(_) => {
                             //ack
-                            channel
-                                .basic_ack(delivery.delivery_tag, BasicAckOptions::default())
-                                .await
-                                .expect("Failed to ack message");
+                            Ok(delivery)
                         }
-                        Err(_e) => {
-                            // requeue
-                            let mut nack_opts = BasicNackOptions::default();
-                            nack_opts.requeue = true;
-                            channel
-                                .basic_nack(delivery.delivery_tag, nack_opts)
-                                .await
-                                .expect("Failed to nack message");
-                        }
+                        Err(e) => Err(CustomError {
+                            message: format!("Could not send mail {:#?}", e.to_string()),
+                            delivery: Some(delivery),
+                            action: MsgAction::NackRequeue,
+                        }),
                     }
                 }
-                Err(e) => {
-                    println!("could not parse message data: {:#?}", e);
-                    dead_letter(&delivery, &channel).await;
-                }
+                Err(e) => Err(CustomError {
+                    message: format!("Could not parse message data {:#?}", e),
+                    delivery: Some(delivery),
+                    action: MsgAction::DeadLetter,
+                }),
             }
         }
-        Err(error) => eprintln!("Error receiving message: {:?}", error),
+        Err(error) => Err(CustomError {
+            message: format!("Error receiving message: {:#?}", error.to_string()),
+            delivery: None,
+            action: MsgAction::NoOp,
+        }),
     }
 }
 
